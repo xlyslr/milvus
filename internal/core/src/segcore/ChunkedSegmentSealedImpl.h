@@ -119,21 +119,20 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     }
 
     // TODO(tiered storage 1): should return a PinWrapper
-    std::pair<milvus::Json, bool>
-    GetJsonData(FieldId field_id, size_t offset) const override {
+    void
+    BulkGetJsonData(FieldId field_id,
+                    std::function<void(milvus::Json, size_t, bool)> fn,
+                    const int64_t* offsets,
+                    int64_t count) const override {
         auto column = fields_.at(field_id);
-        bool is_valid = column->IsValid(offset);
-        if (!is_valid) {
-            return std::make_pair(milvus::Json(), false);
-        }
-        return std::make_pair(column->RawJsonAt(offset), is_valid);
+        column->BulkRawJsonAt(fn, offsets, count);
     }
 
     void
     Reopen(SchemaPtr sch) override;
 
     void
-    LazyCheckSchema(const Schema& sch) override;
+    LazyCheckSchema(SchemaPtr sch) override;
 
     void
     FinishLoad() override;
@@ -319,6 +318,14 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
                               int64_t count,
                               google::protobuf::RepeatedPtrField<T>* dst);
 
+    template <typename T>
+    static void
+    bulk_subscript_vector_array_impl(
+        const ChunkedColumnInterface* column,
+        const int64_t* seg_offsets,
+        int64_t count,
+        google::protobuf::RepeatedPtrField<T>* dst);
+
     static void
     bulk_subscript_impl(int64_t element_sizeof,
                         ChunkedColumnInterface* field,
@@ -374,7 +381,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     LoadScalarIndex(const LoadIndexInfo& info);
 
     bool
-    generate_interim_index(const FieldId field_id);
+    generate_interim_index(const FieldId field_id, int64_t num_rows);
 
     void
     fill_empty_field(const FieldMeta& field_meta);
@@ -397,6 +404,9 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         DataType data_type,
         bool enable_mmap,
         bool is_proxy_column);
+
+    void
+    init_narrow_column_field_ids(const LoadFieldDataInfo& field_data_info);
 
  private:
     // InsertRecord needs to pin pk column.
@@ -429,6 +439,9 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     mutable DeletedRecord<true> deleted_record_;
 
     LoadFieldDataInfo field_data_info_;
+
+    // for storage v2
+    std::vector<FieldId> narrow_column_field_ids_;
 
     SchemaPtr schema_;
     int64_t id_;

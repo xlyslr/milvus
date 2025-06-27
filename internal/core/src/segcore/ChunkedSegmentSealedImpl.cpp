@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "Utils.h"
@@ -35,6 +36,7 @@
 #include "common/EasyAssert.h"
 #include "common/FieldMeta.h"
 #include "common/Json.h"
+#include "common/JsonCastType.h"
 #include "common/LoadInfo.h"
 #include "common/Schema.h"
 #include "common/SystemProperty.h"
@@ -89,6 +91,10 @@ ChunkedSegmentSealedImpl::LoadIndex(const LoadIndexInfo& info) {
     // NOTE: lock only when data is ready to avoid starvation
     auto field_id = FieldId(info.field_id);
     auto& field_meta = schema_->operator[](field_id);
+
+    if (field_meta.get_data_type() == DataType::VECTOR_ARRAY) {
+        PanicInfo(DataTypeInvalid, "VECTOR_ARRAY is not implemented");
+    }
 
     if (field_meta.is_vector()) {
         LoadVecIndex(info);
@@ -167,8 +173,8 @@ ChunkedSegmentSealedImpl::LoadScalarIndex(const LoadIndexInfo& info) {
         JsonIndex index;
         index.nested_path = path;
         index.field_id = field_id;
-        index.index = std::move(const_cast<LoadIndexInfo&>(info).index);
-        index.cast_type = index.index->GetCastType();
+        index.index = std::move(const_cast<LoadIndexInfo&>(info).cache_index);
+        index.cast_type = JsonCastType::FromString(info.index_params.at(JSON_CAST_TYPE));
         json_indices.push_back(std::move(index));
         return;
     }
@@ -244,6 +250,8 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
     size_t num_rows = storage::GetNumRowsForLoadInfo(load_info);
     ArrowSchemaPtr arrow_schema = schema_->ConvertToArrowSchema();
 
+    auto field_ids = schema_->get_field_ids();
+
     for (auto& [id, info] : load_info.field_infos) {
         AssertInfo(info.row_count > 0, "The row count of field data is 0");
 
@@ -252,12 +260,6 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
         storage::SortByPath(insert_files);
         auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
                       .GetArrowFileSystem();
-        auto file_reader = std::make_shared<milvus_storage::FileRowGroupReader>(
-            fs, insert_files[0], arrow_schema);
-        std::shared_ptr<milvus_storage::PackedFileMetadata> metadata =
-            file_reader->file_metadata();
-
-        auto field_id_mapping = metadata->GetFieldIDMapping();
 
         std::vector<milvus_storage::RowGroupMetadataVector> row_group_meta_list;
         for (const auto& file : insert_files) {
@@ -267,20 +269,20 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 reader->file_metadata()->GetRowGroupMetadataVector());
         }
 
-        milvus_storage::FieldIDList field_id_list =
-            metadata->GetGroupFieldIDList().GetFieldIDList(
-                column_group_id.get());
         std::vector<FieldId> milvus_field_ids;
+        if (column_group_id == FieldId(DEFAULT_SHORT_COLUMN_GROUP_ID)) {
+            milvus_field_ids = narrow_column_field_ids_;
+        } else {
+            milvus_field_ids.push_back(column_group_id);
+        }
 
         // if multiple fields share same column group
         // hint for not loading certain field shall not be working for now
         // warmup will be disabled only when all columns are not in load list
         bool merged_in_load_list = false;
-        for (int i = 0; i < field_id_list.size(); ++i) {
-            milvus_field_ids.emplace_back(field_id_list.Get(i));
-            merged_in_load_list =
-                merged_in_load_list ||
-                schema_->ShallLoadField(FieldId(field_id_list.Get(i)));
+        for (int i = 0; i < milvus_field_ids.size(); ++i) {
+            merged_in_load_list = merged_in_load_list ||
+                                  schema_->ShallLoadField(milvus_field_ids[i]);
         }
 
         auto column_group_info = FieldDataInfo(column_group_id.get(),
@@ -302,7 +304,8 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 insert_files,
                 info.enable_mmap,
                 row_group_meta_list,
-                field_id_list);
+                schema_->size(),
+                load_info.load_priority);
 
         auto chunked_column_group =
             std::make_shared<ChunkedColumnGroup>(std::move(translator));
@@ -354,7 +357,8 @@ ChunkedSegmentSealedImpl::load_field_data_internal(
                 ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
             pool.Submit(LoadArrowReaderFromRemote,
                         insert_files,
-                        field_data_info.arrow_reader_channel);
+                        field_data_info.arrow_reader_channel,
+                        load_info.load_priority);
 
             LOG_INFO("segment {} submits load field {} task to thread pool",
                      this->get_segment_id(),
@@ -379,7 +383,8 @@ ChunkedSegmentSealedImpl::load_field_data_internal(
                     field_meta,
                     field_data_info,
                     std::move(insert_files_with_entries_nums),
-                    info.enable_mmap);
+                    info.enable_mmap,
+                    load_info.load_priority);
 
             auto data_type = field_meta.get_data_type();
             auto column = MakeChunkedColumnBase(
@@ -455,12 +460,20 @@ ChunkedSegmentSealedImpl::AddFieldDataInfoForSealed(
     const LoadFieldDataInfo& field_data_info) {
     // copy assignment
     field_data_info_ = field_data_info;
+    if (field_data_info_.storage_version == 2) {
+        init_narrow_column_field_ids(field_data_info);
+    }
 }
 
 // internal API: support scalar index only
 int64_t
 ChunkedSegmentSealedImpl::num_chunk_index(FieldId field_id) const {
     auto& field_meta = schema_->operator[](field_id);
+
+    if (field_meta.get_data_type() == DataType::VECTOR_ARRAY) {
+        PanicInfo(DataTypeInvalid, "VECTOR_ARRAY is not implemented");
+    }
+
     if (field_meta.is_vector()) {
         return int64_t(vector_indexings_.is_ready(field_id));
     }
@@ -794,7 +807,7 @@ ChunkedSegmentSealedImpl::check_search(const query::Plan* plan) const {
         // absent_fields.find_first() returns std::optional<>
         auto field_id =
             FieldId(absent_fields.find_first().value() + START_USER_FIELDID);
-        auto& field_meta = plan->schema_.operator[](field_id);
+        auto& field_meta = plan->schema_->operator[](field_id);
         // request field may has added field
         if (!field_meta.is_nullable()) {
             PanicInfo(FieldNotLoaded,
@@ -1019,11 +1032,12 @@ ChunkedSegmentSealedImpl::bulk_subscript_ptr_impl(
     int64_t count,
     google::protobuf::RepeatedPtrField<std::string>* dst) {
     if constexpr (std::is_same_v<S, Json>) {
-        for (int64_t i = 0; i < count; ++i) {
-            auto offset = seg_offsets[i];
-            Json json = column->RawJsonAt(offset);
-            dst->at(i) = std::move(std::string(json.data()));
-        }
+        column->BulkRawJsonAt(
+            [&](Json json, size_t offset, bool is_valid) {
+                dst->at(offset) = std::move(std::string(json.data()));
+            },
+            seg_offsets,
+            count);
     } else {
         static_assert(std::is_same_v<S, std::string>);
         column->BulkRawStringAt(
@@ -1042,8 +1056,23 @@ ChunkedSegmentSealedImpl::bulk_subscript_array_impl(
     const int64_t* seg_offsets,
     int64_t count,
     google::protobuf::RepeatedPtrField<T>* dst) {
-    column->BulkArrayAt(
-        [dst](ScalarArray&& array, size_t i) { dst->at(i) = std::move(array); },
+    column->BulkArrayAt([dst](ScalarFieldProto&& array,
+                              size_t i) { dst->at(i) = std::move(array); },
+                        seg_offsets,
+                        count);
+}
+
+template <typename T>
+void
+ChunkedSegmentSealedImpl::bulk_subscript_vector_array_impl(
+    const ChunkedColumnInterface* column,
+    const int64_t* seg_offsets,
+    int64_t count,
+    google::protobuf::RepeatedPtrField<T>* dst) {
+    column->BulkVectorArrayAt(
+        [dst](VectorFieldProto&& array, size_t i) {
+            dst->at(i) = std::move(array);
+        },
         seg_offsets,
         count);
 }
@@ -1089,9 +1118,9 @@ ChunkedSegmentSealedImpl::fill_with_empty(FieldId field_id,
                                           int64_t count) const {
     auto& field_meta = schema_->operator[](field_id);
     if (IsVectorDataType(field_meta.get_data_type())) {
-        return CreateVectorDataArray(count, field_meta);
+        return CreateEmptyVectorDataArray(count, field_meta);
     }
-    return CreateScalarDataArray(count, field_meta);
+    return CreateEmptyScalarDataArray(count, field_meta);
 }
 
 void
@@ -1155,7 +1184,7 @@ ChunkedSegmentSealedImpl::CreateTextIndex(FieldId field_id) {
     }
 
     // create index reader.
-    index->CreateReader();
+    index->CreateReader(milvus::index::SetBitsetSealed);
     // release index writer.
     index->Finish();
 
@@ -1366,6 +1395,14 @@ ChunkedSegmentSealedImpl::get_raw_data(FieldId field_id,
                 ret->mutable_vectors()->mutable_int8_vector()->data());
             break;
         }
+        case DataType::VECTOR_ARRAY: {
+            bulk_subscript_vector_array_impl(
+                column.get(),
+                seg_offsets,
+                count,
+                ret->mutable_vectors()->mutable_vector_array()->mutable_data());
+            break;
+        }
         default: {
             PanicInfo(DataTypeInvalid,
                       fmt::format("unsupported data type {}",
@@ -1443,12 +1480,13 @@ ChunkedSegmentSealedImpl::bulk_subscript(
             count);
     }
     auto dst = ret->mutable_scalars()->mutable_json_data()->mutable_data();
-    for (int64_t i = 0; i < count; ++i) {
-        auto offset = seg_offsets[i];
-        Json json = column->RawJsonAt(offset);
-        dst->at(i) =
-            ExtractSubJson(std::string(json.data()), dynamic_field_names);
-    }
+    column->BulkRawJsonAt(
+        [&](Json json, size_t offset, bool is_valid) {
+            dst->at(offset) =
+                ExtractSubJson(std::string(json.data()), dynamic_field_names);
+        },
+        seg_offsets,
+        count);
     return ret;
 }
 
@@ -1679,7 +1717,8 @@ ChunkedSegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
 }
 
 bool
-ChunkedSegmentSealedImpl::generate_interim_index(const FieldId field_id) {
+ChunkedSegmentSealedImpl::generate_interim_index(const FieldId field_id,
+                                                 int64_t num_rows) {
     if (col_index_meta_ == nullptr || !col_index_meta_->HasFiled(field_id)) {
         return false;
     }
@@ -1723,12 +1762,7 @@ ChunkedSegmentSealedImpl::generate_interim_index(const FieldId field_id) {
         return false;
     }
     try {
-        // get binlog data and meta
-        int64_t row_count;
-        {
-            std::shared_lock lck(mutex_);
-            row_count = num_rows_.value();
-        }
+        int64_t row_count = num_rows;
 
         // generate index params
         auto field_binlog_config = std::unique_ptr<VecIndexConfig>(
@@ -1815,9 +1849,9 @@ ChunkedSegmentSealedImpl::RemoveFieldFile(const FieldId field_id) {
 }
 
 void
-ChunkedSegmentSealedImpl::LazyCheckSchema(const Schema& sch) {
-    if (sch.get_schema_version() > schema_->get_schema_version()) {
-        Reopen(std::make_shared<Schema>(sch));
+ChunkedSegmentSealedImpl::LazyCheckSchema(SchemaPtr sch) {
+    if (sch->get_schema_version() > schema_->get_schema_version()) {
+        Reopen(sch);
     }
 }
 
@@ -1861,7 +1895,7 @@ ChunkedSegmentSealedImpl::load_field_data_common(
         insert_record_.seal_pks();
     }
 
-    bool generated_interim_index = generate_interim_index(field_id);
+    bool generated_interim_index = generate_interim_index(field_id, num_rows);
 
     std::unique_lock lck(mutex_);
     set_bit(field_data_ready_bitset_, field_id, true);
@@ -1964,6 +1998,11 @@ ChunkedSegmentSealedImpl::fill_empty_field(const FieldMeta& field_meta) {
                                                           field_meta);
             break;
         }
+        case milvus::DataType::VECTOR_ARRAY: {
+            column = std::make_shared<ChunkedVectorArrayColumn>(
+                std::move(translator), field_meta);
+            break;
+        }
         default: {
             column = std::make_shared<ChunkedColumn>(std::move(translator),
                                                      field_meta);
@@ -1973,6 +2012,25 @@ ChunkedSegmentSealedImpl::fill_empty_field(const FieldMeta& field_meta) {
     auto field_id = field_meta.get_id();
     fields_.emplace(field_id, column);
     set_bit(field_data_ready_bitset_, field_id, true);
+}
+
+void
+ChunkedSegmentSealedImpl::init_narrow_column_field_ids(
+    const LoadFieldDataInfo& field_data_info) {
+    std::unordered_set<int64_t> column_group_ids;
+    for (auto& [id, info] : field_data_info.field_infos) {
+        int64_t group_id =
+            storage::ExtractGroupIdFromPath(info.insert_files[0]);
+        column_group_ids.insert(group_id);
+    }
+
+    std::vector<FieldId> narrow_column_field_ids;
+    for (auto& field_id : schema_->get_field_ids()) {
+        if (column_group_ids.find(field_id.get()) == column_group_ids.end()) {
+            narrow_column_field_ids.push_back(field_id);
+        }
+    }
+    narrow_column_field_ids_ = narrow_column_field_ids;
 }
 
 }  // namespace milvus::segcore

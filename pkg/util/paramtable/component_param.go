@@ -2831,7 +2831,8 @@ type queryNodeConfig struct {
 
 	IndexOffsetCacheEnabled ParamItem `refreshable:"true"`
 
-	ReadAheadPolicy ParamItem `refreshable:"false"`
+	ReadAheadPolicy     ParamItem `refreshable:"false"`
+	ChunkCacheWarmingUp ParamItem `refreshable:"true"`
 
 	MaxReceiveChanSize    ParamItem `refreshable:"false"`
 	MaxUnsolvedQueueSize  ParamItem `refreshable:"true"`
@@ -2895,7 +2896,6 @@ type queryNodeConfig struct {
 
 	// Idf Oracle
 	IDFEnableDisk       ParamItem `refreshable:"true"`
-	IDFLocalPath        ParamItem `refreshable:"true"`
 	IDFWriteConcurrenct ParamItem `refreshable:"true"`
 	// partial search
 	PartialResultRequiredDataRatio ParamItem `refreshable:"true"`
@@ -2909,14 +2909,6 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		DefaultValue: "true",
 	}
 	p.IDFEnableDisk.Init(base.mgr)
-
-	p.IDFLocalPath = ParamItem{
-		Key:          "queryNode.idfOracle.localPath",
-		Version:      "2.6.0",
-		Export:       true,
-		DefaultValue: "/var/lib/milvus/bm25_logs",
-	}
-	p.IDFLocalPath.Init(base.mgr)
 
 	p.IDFWriteConcurrenct = ParamItem{
 		Key:          "queryNode.idfOracle.writeConcurrency",
@@ -3011,11 +3003,11 @@ Note that if eviction is enabled, cache data loaded during sync warmup is also s
 	p.TieredMemoryLowWatermarkRatio = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.memoryLowWatermarkRatio",
 		Version:      "2.6.0",
-		DefaultValue: "0.6",
+		DefaultValue: "0.75",
 		Formatter: func(v string) string {
 			ratio := getAsFloat(v)
 			if ratio < 0 || ratio > 1 {
-				return "0.6"
+				return "0.75"
 			}
 			return fmt.Sprintf("%f", ratio)
 		},
@@ -3061,11 +3053,11 @@ eviction is necessary and the amount of data to evict from memory/disk.
 	p.TieredDiskLowWatermarkRatio = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.diskLowWatermarkRatio",
 		Version:      "2.6.0",
-		DefaultValue: "0.6",
+		DefaultValue: "0.75",
 		Formatter: func(v string) string {
 			ratio := getAsFloat(v)
 			if ratio < 0 || ratio > 1 {
-				return "0.6"
+				return "0.75"
 			}
 			return fmt.Sprintf("%f", ratio)
 		},
@@ -3122,11 +3114,11 @@ eviction is necessary and the amount of data to evict from memory/disk.
 	p.TieredEvictionIntervalMs = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.evictionIntervalMs",
 		Version:      "2.6.0",
-		DefaultValue: "10000",
+		DefaultValue: "1000",
 		Formatter: func(v string) string {
 			window := getAsInt64(v)
 			if window < 0 {
-				return "10000"
+				return "1000"
 			}
 			return fmt.Sprintf("%d", window)
 		},
@@ -3501,6 +3493,15 @@ However, this optimization may come at the cost of a slight decrease in query la
 		Export:       true,
 	}
 	p.ReadAheadPolicy.Init(base.mgr)
+
+	// this is being deprecated, thus not exported
+	p.ChunkCacheWarmingUp = ParamItem{
+		Key:          "queryNode.cache.warmup",
+		Version:      "2.3.6",
+		DefaultValue: "disable",
+		Export:       false,
+	}
+	p.ChunkCacheWarmingUp.Init(base.mgr)
 
 	p.MaxReceiveChanSize = ParamItem{
 		Key:          "queryNode.scheduler.receiveChanSize",
@@ -5181,7 +5182,8 @@ type dataNodeConfig struct {
 	// index services config
 	BuildParallel ParamItem `refreshable:"false"`
 
-	WorkerSlotUnit ParamItem `refreshable:"true"`
+	WorkerSlotUnit      ParamItem `refreshable:"true"`
+	StandaloneSlotRatio ParamItem `refreshable:"false"`
 }
 
 func (p *dataNodeConfig) init(base *BaseTable) {
@@ -5467,6 +5469,10 @@ if this parameter <= 0, will set it as 10`,
 		Version:      "2.4.0",
 		Doc:          "The insert buffer size (in MB) during import.",
 		DefaultValue: "64",
+		Formatter: func(v string) string {
+			bufferSize := getAsFloat(v)
+			return fmt.Sprintf("%d", int(megaBytes2Bytes(bufferSize)))
+		},
 		PanicIfEmpty: false,
 		Export:       true,
 	}
@@ -5477,6 +5483,10 @@ if this parameter <= 0, will set it as 10`,
 		Version:      "2.5.14",
 		Doc:          "The delete buffer size (in MB) during import.",
 		DefaultValue: "16",
+		Formatter: func(v string) string {
+			bufferSize := getAsFloat(v)
+			return fmt.Sprintf("%d", int(megaBytes2Bytes(bufferSize)))
+		},
 		PanicIfEmpty: false,
 		Export:       true,
 	}
@@ -5600,6 +5610,14 @@ if this parameter <= 0, will set it as 10`,
 		Doc:          "Indicates how many slots each worker occupies per 2c8g",
 	}
 	p.WorkerSlotUnit.Init(base.mgr)
+
+	p.StandaloneSlotRatio = ParamItem{
+		Key:          "dataNode.standaloneSlotFactor",
+		Version:      "2.5.14",
+		DefaultValue: "0.25",
+		Doc:          "Offline task slot ratio in standalone mode",
+	}
+	p.StandaloneSlotRatio.Init(base.mgr)
 }
 
 type streamingConfig struct {
@@ -5607,6 +5625,7 @@ type streamingConfig struct {
 	WALBalancerTriggerInterval        ParamItem `refreshable:"true"`
 	WALBalancerBackoffInitialInterval ParamItem `refreshable:"true"`
 	WALBalancerBackoffMultiplier      ParamItem `refreshable:"true"`
+	WALBalancerBackoffMaxInterval     ParamItem `refreshable:"true"`
 	WALBalancerOperationTimeout       ParamItem `refreshable:"true"`
 
 	// balancer Policy
@@ -5641,8 +5660,9 @@ type streamingConfig struct {
 	WALRecoveryPersistInterval      ParamItem `refreshable:"true"`
 	WALRecoveryMaxDirtyMessage      ParamItem `refreshable:"true"`
 	WALRecoveryGracefulCloseTimeout ParamItem `refreshable:"true"`
-	WALTruncateSampleInterval       ParamItem `refreshable:"true"`
-	WALTruncateRetentionInterval    ParamItem `refreshable:"true"`
+
+	WALTruncateSampleInterval    ParamItem `refreshable:"true"`
+	WALTruncateRetentionInterval ParamItem `refreshable:"true"`
 }
 
 func (p *streamingConfig) init(base *BaseTable) {
@@ -5659,9 +5679,9 @@ It's ok to set it into duration string, such as 30s or 1m30s, see time.ParseDura
 	p.WALBalancerBackoffInitialInterval = ParamItem{
 		Key:     "streaming.walBalancer.backoffInitialInterval",
 		Version: "2.6.0",
-		Doc: `The initial interval of balance task trigger backoff, 50 ms by default.
+		Doc: `The initial interval of balance task trigger backoff, 10 ms by default.
 It's ok to set it into duration string, such as 30s or 1m30s, see time.ParseDuration`,
-		DefaultValue: "50ms",
+		DefaultValue: "10ms",
 		Export:       true,
 	}
 	p.WALBalancerBackoffInitialInterval.Init(base.mgr)
@@ -5673,12 +5693,21 @@ It's ok to set it into duration string, such as 30s or 1m30s, see time.ParseDura
 		Export:       true,
 	}
 	p.WALBalancerBackoffMultiplier.Init(base.mgr)
+	p.WALBalancerBackoffMaxInterval = ParamItem{
+		Key:     "streaming.walBalancer.backoffMaxInterval",
+		Version: "2.6.0",
+		Doc: `The max interval of balance task trigger backoff, 5s by default.
+It's ok to set it into duration string, such as 30s or 1m30s, see time.ParseDuration`,
+		DefaultValue: "5s",
+		Export:       true,
+	}
+	p.WALBalancerBackoffMaxInterval.Init(base.mgr)
 	p.WALBalancerOperationTimeout = ParamItem{
 		Key:     "streaming.walBalancer.operationTimeout",
 		Version: "2.6.0",
-		Doc: `The timeout of wal balancer operation, 10s by default.
+		Doc: `The timeout of wal balancer operation, 30s by default.
 If the operation exceeds this timeout, it will be canceled.`,
-		DefaultValue: "10s",
+		DefaultValue: "30s",
 		Export:       true,
 	}
 	p.WALBalancerOperationTimeout.Init(base.mgr)
@@ -5870,10 +5899,10 @@ If that persist operation exceeds this timeout, the wal recovery module will clo
 	p.WALTruncateSampleInterval = ParamItem{
 		Key:     "streaming.walTruncate.sampleInterval",
 		Version: "2.6.0",
-		Doc: `The interval of sampling wal checkpoint when truncate, 1m by default.
+		Doc: `The interval of sampling wal checkpoint when truncate, 30m by default.
 Every time the checkpoint is persisted, the checkpoint will be sampled and used to be a candidate of truncate checkpoint.
 More samples, more frequent truncate, more memory usage.`,
-		DefaultValue: "1m",
+		DefaultValue: "30m",
 		Export:       true,
 	}
 	p.WALTruncateSampleInterval.Init(base.mgr)
@@ -5881,10 +5910,14 @@ More samples, more frequent truncate, more memory usage.`,
 	p.WALTruncateRetentionInterval = ParamItem{
 		Key:     "streaming.walTruncate.retentionInterval",
 		Version: "2.6.0",
-		Doc: `The retention interval of wal truncate, 5m by default.
+		Doc: `The retention interval of wal truncate, 26h by default.
 If the sampled checkpoint is older than this interval, it will be used to truncate wal checkpoint.
-Greater the interval, more wal storage usage, more redundant data in wal`,
-		DefaultValue: "5m",
+Greater the interval, more wal storage usage, more redundant data in wal.
+Because current query path doesn't promise the read operation not happen before the truncate point,
+retention interval should be greater than the dataCoord.segment.maxLife to avoid the message lost at query path.
+If the wal is pulsar, the pulsar should close the subscription expiration to avoid the message lost.
+because the wal truncate operation is implemented by pulsar consumer.`,
+		DefaultValue: "26h",
 		Export:       true,
 	}
 	p.WALTruncateRetentionInterval.Init(base.mgr)

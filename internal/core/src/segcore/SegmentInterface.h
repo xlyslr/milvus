@@ -137,18 +137,21 @@ class SegmentInterface {
     virtual index::TextMatchIndex*
     GetTextIndex(FieldId field_id) const = 0;
 
-    virtual index::IndexBase*
+    virtual PinWrapper<index::IndexBase*>
     GetJsonIndex(FieldId field_id, std::string path) const {
         return nullptr;
     }
     virtual index::JsonKeyStatsInvertedIndex*
     GetJsonKeyIndex(FieldId field_id) const = 0;
 
-    virtual std::pair<milvus::Json, bool>
-    GetJsonData(FieldId field_id, size_t offset) const = 0;
+    virtual void
+    BulkGetJsonData(FieldId field_id,
+                    std::function<void(milvus::Json, size_t, bool)> fn,
+                    const int64_t* offsets,
+                    int64_t count) const = 0;
 
     virtual void
-    LazyCheckSchema(const Schema& sch) = 0;
+    LazyCheckSchema(SchemaPtr sch) = 0;
 
     // reopen segment with new schema
     virtual void
